@@ -1,0 +1,437 @@
+---
+title: "Gas exchange in Delmarva bays"
+output:
+  html_notebook:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+editor_options: 
+  chunk_output_type: inline
+---
+```{r setup, message=FALSE}
+library(CHNOSZ)
+data(thermo)
+library(xts)
+library(dplyr)
+library(dygraphs)
+library(purrr)
+library(ggplot2)
+library(RPostgreSQL)
+library(lubridate)
+library(readr)
+```
+
+Calculate a time series of $k$ in $\frac{cm}{hr}$ using inputs: water temperature, water depth, wind speed. $k$ is calculated using equation 2 in Poindexter et al. 2016, which uses a different formulation for wind-driven vs. thermal convection driven gas exchange based on thresholds for heat flux. 
+
+# Background
+
+## Gas flux equation
+
+$Flux = k(C_{eq} - C_w)$
+
+$k$ is typically reported as $k_{600}$ to facilitate comparison. 
+
+$k_{600} = k(\frac{600}{Sc})^{-n}$
+
+$n$ is a factor characterizing the kinematic behavior of the water surface. 
+
+## Previous studies 
+
+The most relevant studies on calculating gas exchange are:
+
+* Read et al. 2012
+* Holgerson et al 2017
+* MacIntyre et al. 2010 - model $k$ with two functions of $U_{10}$, one for periods of surface heat loss and one for periods of heat gain
+* Soloviev et al. 2007 - combined effects of surface heat loss and wind via surface dissipation of turbulent kinetic energy (from combined effects of buoyancy, wind shear, wave breaking)
+* Poindexter and Variano 2013 - develop an analytical relationship between surface heat flux $q$ and $k$ (based on laboratory measurements)
+* Poindexter et al. 2016
+
+Poindexter and Variano (2013) developed new models for wetlands with emergent vegetation, based on the idea that emergent vegetation would attenuate wind speed above the water surface, modify fluid shear at the water surface, and influence stirring beneath the water surface. They focus on thermal convection, parameterized from surface heat loss, and wind shear, parameterized using the mean wind speed in the constant-velocity or shear-free region of the vegetation canopy.  
+
+Forested wetlands like Delmarva bays can be inundated areas without emergent vegetation (e.g. forested ponds), where tree canopy attenuates wind speed but effects of plant stems are not as relevant. 
+
+Using Poindexter et al 2016 method for wetland perspective, where emergent vegetation and surfactants are important. New relationships for $k$ designed specifically for use in the presence of an emergent vegetation canopy. Based on lab measurements with a model wetland, which suggested a quadratic relationship between $k$ and the mean in-canopy wind speed (Poindexter and Variano, 2013). 
+
+$k$ is wind-driven when $q \geq 0$ or $Ra < 8 \times 10^6$, and thermal convection driven when $q < 0$ and $Ra > 8 \times 10^6$. $Ra$ is the Rayleigh number, a function of heat flux. When $Ra$ is below a critical value for a fluid, then heat transfer is primarily in the form of conduction; when it exceeds that value then heat transfer is primarily in the form of convection. *Except if water temperature is below 4 deg C, then $\beta$ changes sign and $k$ is thermally driven by $q > 0$. 
+
+* First check if $q\geq 0$, if yes, use $k_{wind}$ unless water temp < 4.
+* If $q < 0$, use $k_{thermal}$ unless $Ra < 8\times 10^6$.
+
+# Surface Heat Flux
+
+Surface heat flux $(q)$ can be used to estimate thermal convection. Negative heat fluxes indicate a cooling water column (water losing heat to the air) and positive heat flux means the water column is warming. Typical values of $q$ in temperate wetlands are -200 to 300 W m^-2. Convective mixing occurs when the water is losing heat to the air $(q < 0)$.
+
+$q = \frac{dT_b}{dt}\rho c_pH$
+
+* $c_p$ is the isobaric heat capacity (isobaric = constant pressure), in $\frac{J}{kgK}$
+* $\rho$ is water density, in $\frac{kg}{m^3}$
+* $H$ is the depth of the water column, in meters
+* $T_b$ is the bulk water temperature
+
+
+Calculate $q$, using functions from the `CHNOSZ` package to calculate water density and isobaric heat capacity
+
+```{r}
+calc_q_heatflux <- function(temp_C, waterdepth_m, dT, dt_sec = 3600){
+  # isobaric heat capacity cal K^-1 mol^-1
+  cp = as.numeric(
+    CHNOSZ::water("Cp", T = 273.15 + temp_C))
+  # water density kg m^-3
+  rho = as.numeric(
+    CHNOSZ::water("rho", T = 273.15 + temp_C))
+  # convert cp to J kg^-1 K^-1
+  cp = cp*(4.184/0.018)
+  
+  q_wm2 <- (dT/dt_sec) * rho * cp * waterdepth_m
+  return(q_wm2)
+}
+```
+
+# Rayleigh Number calculation
+
+Used in combination with $q$ to determine which formula to use for calculation of $k$. 
+
+$Ra = 4.7(\frac{-qg\beta L^4}{\alpha^2vc_p\rho})^{\frac{3}{4}}$
+
+* $g$ - acceleration due to gravity
+* $q$ - water column heat flux
+* $L$ - characteristic length scale, wetland depth
+
+Poindexter and Variano (2013) find that using the wetland depth as the length scale $L$, the Rayleigh number threshold is met for wetland water columns deeper than 10cm for typical heat loss rates. 
+
+* $\beta$ - thermal expansion coefficient
+* $\alpha$ - thermal diffusivity
+* $v$ - kinematic viscosity
+* $c_p$ - heat capacity at constant pressure
+* $\rho$ - density
+
+```{r}
+calc_rayleigh <- function(q, temp_C = 25, lscale = 1){
+  g = -9.8 # m s^-2
+  beta = as.numeric(
+    CHNOSZ::water("alpha", T = 273.15 + temp_C)) # K^-1
+  alpha = as.numeric(
+    CHNOSZ::water("tdiff", T = 273.15 + temp_C)) #cm^2 s^-1
+  kv = as.numeric(
+    CHNOSZ::water("visck", T = 273.15 + temp_C)) #cm^2 s^-1
+  cp = as.numeric(
+    CHNOSZ::water("Cp", T = 273.15 + temp_C))
+  rho = as.numeric(
+    CHNOSZ::water("rho", T = 273.15 + temp_C)) # kg m^-3
+
+  # convert cm to m
+  alpha = alpha/10000
+  kv = kv/10000
+  
+  ra <- 4.7*((-q*g*beta*lscale^4)/
+       (alpha^2*kv*cp*rho))^(3/4)
+  return(ra)
+}
+```
+
+```{r}
+calc_rayleigh(q = .1, temp_C = 30, lscale = .10)
+calc_rayleigh(q = .10, temp_C = 30, lscale = .10) > 8e6
+```
+
+
+# Thermal convection K
+
+From Poindexter et al. 2016 (GRL), a semi-emprical function derived from the relationship between heat flux and thermal convection, which is similar to the surface renewal models used for periods of relative calm in lakes and oceans by Read et al. 2012 and Soloviev et al. 2007. 
+
+$k = 0.14^{\frac{3}{4}}(\frac{-qg\beta\alpha^2}{vc_p\rho})^{\frac{1}{4}}(\frac{Sc}{Pr})^{-n}$
+
+* $q$ - water column heat flux, calculated from rate of change in wetland water column temperature with time (described in supporting info) 
+* $g$ - acceleration due to gravity
+* $Sc$ - Schmidt number
+
+Functions of water temperature and atmospheric pressure:
+
+* $\beta$ - thermal expansion coefficient
+* $\alpha$ - thermal diffusivity
+* $v$ - kinematic viscosity
+* $c_p$ - heat capacity at constant pressure
+* $\rho$ - density
+* $Pr$ - Prandtl number
+
+Calculate k for thermal convection
+
+```{r}
+calc_k_poindexter2b <- function(q, temp_C, n_surface = (2/3)){
+  # if(q < 0){stop("Negative heat flux. 
+  #                Please use wind model to calculate K.")}
+  g = 9.8 # m s^-2
+  beta = as.numeric(
+    CHNOSZ::water("alpha", T = 273.15 + temp_C)) # K^-1
+  alpha = as.numeric(
+    CHNOSZ::water("tdiff", T = 273.15 + temp_C)) #cm^2 s^-1
+  kv = as.numeric(
+    CHNOSZ::water("visck", T = 273.15 + temp_C)) #cm^2 s^-1
+  cp = as.numeric(
+    CHNOSZ::water("Cp", T = 273.15 + temp_C))
+  rho = as.numeric(
+    CHNOSZ::water("rho", T = 273.15 + temp_C)) # kg m^-3
+  Pr = as.numeric(
+    CHNOSZ::water("Prndtl", T = 273.15 + temp_C))
+  Sc = 600
+  
+  # convert cp to J kg^-1 K^-1
+  cp = cp*(4.184/0.018)
+  # convert cm to m
+  alpha = alpha/10000
+  kv = kv/10000
+  
+  k = (0.14^(3/4)) *
+    ((-q * g * beta * alpha^2)/(kv * cp * rho))^(1/4) * 
+    (Sc/Pr)^(-n_surface)
+  
+  k_cmhr = k*100*3600
+  return(k_cmhr)
+}
+```
+
+```{r}
+calc_k_poindexter2b(q = 50, temp_C = 25) # cm/hr
+calc_k_poindexter2b(q = -50, temp_C = 25) # cm/hr
+```
+
+
+# Wind-driven k
+
+$k = 3\Gamma{\langle U_{canopy}}\rangle^2 (\frac{Sc}{600})^{-n}$
+
+* $\Gamma$ enhancement factor to account for fluctuations that increase the gas transfer velocity relative to value predicted from mean wind speed alone. Poindexter et al. use $\Gamma = 0.32$ based on in-canopy wind speed measurements at their marsh study site. (Poindexter and Variano use 1.3 though?)
+* $U_{canopy}$ is mean in-canopy wind speed, which can be computed from wind shear stress and wind speed measured above the canopy (but is being monitored at sites QB and ND)
+
+Calculate k for wind driven turbulence.
+
+```{r}
+calc_k_poindexter2a <- function(ws, gamma = (1/3), Sc = 600, n_surface = (2/3)){
+  k = 3*gamma*(ws)^2 * (Sc/600)^(-n_surface)
+  return(k)
+}
+```
+
+In-canopy wind speed is assumed to be in the zone where wind speed profile is vertical? 
+
+# Data
+
+Load data to use the equations above for calculating $k$. Aggregate high resolution data to hourly means. 
+
+### Temperature
+
+Water temperature measured at 3 locations in a vertical profile, in 2 wetlands. Need to compare with water level to determine when sensors were in the water and when they were exposed (also evident by looking at daily fluctuations).
+
+Look at typical daily time series pattern of temperature in the water column, to determine how to calculate $\frac{dT}{dt}$. Poindexter and Variano use linear regression of temperature readings during their experiments. 
+
+### Wind
+
+In-canopy wind speed measured with sonic anemometers approximately 1m over the water surface (varies between xx and xx due to changes in water level). 
+
+```{r}
+wind_df <- read_csv("data/windspeed_qb.csv")
+```
+
+
+```{r}
+wind_df %>% 
+  mutate(date = lubridate::date(datetime)) %>%
+  mutate(time_hr = lubridate::hour(datetime)) %>% 
+  # filter(date >= as.Date('2018-06-01') & date <= as.Date('2018-07-01')) %>%
+  ggplot(aes(x = time_hr, y = ws_ms, group = date)) +
+  geom_line(aes(col = date)) +
+  # facet_wrap(~ lubridate::month(date)) +
+  # facet_wrap(~ lubridate::yday(date)) +
+  # facet_wrap(~ lubridate::wday(date, TRUE)) +
+  xlim(c(0, 24)) +
+  theme_bw()
+```
+
+
+
+### Water depth
+
+Combine into one data frame and Aggregate time series to hourly averages
+
+```{r}
+# head(qbMID) 
+# qbMID_xts <- xts(qbMID$temp_C, order.by = qbMID$datetime)
+# # hourly aggregate
+# ep <- endpoints(qbMID_xts, on = "hour")
+# qbMID_agg <- period.apply(qbMID_xts[,], INDEX = ep, FUN = mean)
+# head(qbMID_agg)
+# plot(qbMID_agg)
+```
+
+# Apply Calculations
+
+Make a function that will use that as input to calculate a new column with $k$ values.
+
+1. Calculate `dT` from temperature column
+1. Add `temp_thresh` (if `temp_C` < 4)
+1. Calculate `q` (heat flux) and `q_neg` (if $q < 0$)
+1. Calculate `Ra` and `Ra_thresh` (if $Ra > 8\times 10^6$)
+1. Determine `k_category` (wind or thermal), if conditions for $k_{thermal}$ are met: `q_neg = TRUE`, `Ra_thresh = TRUE`, or `temp_thresh = TRUE`. 
+1. For rows where `k_category == "wind"`, calculate `k_cmhr` using `calc_k_poindexter2a()`. 
+1. For rows where `k_category == "thermal"`, calculate `k_cmhr` using `calc_k_poindexter2b()`.
+
+Calculate time series of $q$ surface heat flux ($Wm^{-2}$) as a function of temperature time series and water column depth
+
+* $\frac{dT_b}{dt}$ in $\frac{K}{sec}$ will need to convert from $\frac{C}{hr}$
+
+Calculate differences
+```{r}
+# difference object
+dT <- diff(qbMID_agg[,1])
+# plot(dT)
+# head(dT)
+```
+
+Add column for water depth (Right now assuming static at 1m)
+
+```{r}
+q_ts <- merge(qbMID_agg, dT) %>%
+  as.data.frame() %>%
+  dplyr::rename(temp_C = qbMID_agg) %>%
+  mutate(waterdepth_m = 1)
+# q_ts <- merge(qbBOT_agg, dT) %>% 
+#   as.data.frame() %>% 
+#   rename(temp_C = qbBOT_agg) %>%
+#   mutate(waterdensity = 
+#            purrr::map_dbl(temp_C, ~calc_water_density_kgm3(temp_C = .x))) %>%
+#   mutate(cp = 
+#            purrr::map_dbl(temp_C, ~calc_Cp_JkgK(temp_C = .x))) %>%
+#   mutate(waterdepth_m = 1) %>%
+#   mutate(q = (dT/3600) * waterdensity * cp * waterdepth_m)
+```
+
+Apply function to calculate q to time series
+
+```{r}
+q_ts$q_wm2 <- q_ts %>% pmap_dbl(calc_q_heatflux)
+```
+
+
+```{r}
+q_xts <- merge(dT, q_ts$q_wm2)
+q_xts <- merge(q_xts, q_ts$temp_C)
+q_xts <- merge(q_xts, q_ts$waterdepth_m)
+# head(q_xts)
+# plot(q_xts[,2])
+```
+
+```{r}
+# dygraph(q_xts[,"q_ts.q_wm2"]) %>%
+#   dyRangeSelector() %>%
+#   dyLegend() %>%
+#  dyAxis("y", label = "Q") %>%
+#   dyOptions(strokeWidth = 1)
+```
+
+```{r}
+kdf <- q_xts %>% 
+  as.data.frame() %>%
+  tibble::rownames_to_column() %>% 
+  dplyr::rename(datetime = rowname, q_wm2 = q_ts.q_wm2,
+                temp_C = q_ts.temp_C, waterdepth_m = q_ts.waterdepth_m) %>%
+  mutate(q_neg = q_wm2 <0) %>%
+  mutate(temp_thresh = temp_C < 4)
+```
+
+```{r}
+head(kdf)
+```
+
+```{r}
+kdf %>% 
+  mutate(datetime = as.POSIXct(datetime)) %>%
+  ggplot(aes(x = datetime, y = q_wm2)) +
+  geom_line() +
+  theme_bw()
+```
+
+
+```{r}
+# kdf$Ra <- kdf %>% pmap_dbl(calc_rayleigh())
+kdf$Ra <- pmap_dbl(list(q = kdf$q_wm2, 
+                        temp_C = kdf$temp_C, 
+                        lscale = kdf$waterdepth_m), 
+                   calc_rayleigh)
+```
+
+```{r}
+kdf$Ra_thresh <- kdf$Ra > 8e6
+```
+
+```{r}
+kdf$k_category <- NA
+kdf <- kdf %>%
+  mutate(k_category = dplyr::case_when(
+    (q_neg == TRUE & Ra_thresh == TRUE) | temp_thresh == TRUE ~ "thermal"
+  )) %>% 
+  mutate(k_category = dplyr::case_when(
+    (q_neg == FALSE) ~ "wind"
+  ))
+kdf <- dplyr::filter(kdf, !is.na(q_wm2))
+```
+
+```{r}
+# kdf$k_thermal <- NA
+# kdf$k_thermal <-
+kdf %>% dplyr::filter(k_category == "thermal") %>% head()
+  mutate(
+  case_when(k_category == "thermal" ~ 
+              purrr::pmap_dbl(list(q = q_wm2, temp_C = temp_C),
+                       calc_k_poindexter2b))) %>% head()
+```
+
+```{r}
+kdf %>% dplyr::filter(k_category == "wind") %>% head()
+```
+
+# Notes
+
+**Ideas**
+
+Compare methane flux and k measurements with and without changing water levels - what is the effect of including changing water level? what is the relative importance of a) changing areal extent of water surface to scale flux by? b) change in k value and k category on the magnitude of the flux? c) dilution effect of the methane concentration in the water?
+
+
+
+Surface heat flux approach in Read et al. 2012 assumes that sediment heating, advected components, and changes in water levels are negligible. These assumptions do not hold in delmarva bay wetland systems! 
+
+Delmarva bay wetland sites are sheltered by tree canopy which affects the wind shear driven gas exchange. Read et al. method using approach of scaling the effect of wind sheltering where the size of the lake is small enough, so k is reduced for area affected by sheltering as a function of distance from tree canopy. Unlike that method, there is no water surface area that is unaffected by effects of canopy sheltering. Canopy height measurements from Dubayah et al. CMS product. 
+
+In-canopy wind speed is calculated in Poindexter et al. method, as a function of wind speed measured at 10m. 
+
+Our measurements of wind speed can be used to evaluate the other methods, by comparing measured in-canopy wind speed to wind speed from a nearby weather station (measured above the canopy). Need to find a local weather station to do that? 
+
+Need to understand what the enhancement factor is all about - can I just use $k = \langle U_{canopy}\rangle^2(\frac{Sc}{600})^{-n}$ - additional factor beyond mean wind speed to characterize effect of wind on $k$ because the largest scale eddies in the canopy wind field are highly intermittent. Poindexter and Variano 2013 give a relationship for the $k_{600}$ enhancement factor as a fucntion of $\frac{\langle(U_{canopy}-\langle U_{canopy}\rangle)^2\rangle^{\frac{1}{2}}}{\langle U_{canopy}\rangle}$. The effect of the gusts is interactions between the wind and plant canopy that generates intermittent, large-scale eddies, which presumably are the gusts that enhance gas exchange in natural wetlands.
+
+Compare wind gust speeeds and wind speeds from sonic anemometer measurements to help think about this. 
+
+```{r}
+gusts <- read_csv("data/windgusts_qb.csv")
+```
+
+```{r}
+gusts %>% 
+  mutate(date = lubridate::date(datetime)) %>%
+  mutate(time_hr = lubridate::hour(datetime)) %>% 
+  # filter(date >= as.Date('2018-06-01') & date <= as.Date('2018-07-01')) %>%
+  ggplot(aes(x = time_hr, y = gusts_ms, group = date)) +
+  geom_line(aes(col = date)) +
+  # facet_wrap(~ lubridate::month(date)) +
+  # facet_wrap(~ lubridate::yday(date)) +
+  # facet_wrap(~ lubridate::wday(date, TRUE)) +
+  xlim(c(0, 24)) +
+  theme_bw()
+```
+
+**Other relevant studies**
+
+* Godwin et al. 2013 JGR Evening methane emission events - found that timing of nighttime emission events (as measured by flux towers) coincided with cooling and convective mixing within hollows, which occurred regularly during the growing season. They propose that diurnal thermal stratification in shallow pools traps methane by limiting turbulent transport, and this methane stored during daytime heating is later released during evening cooling due to convective turbulent mixing. 
+* Happell et al. 1995 used floating chamber measurements in a Florida hardwood swamp and found $k_{600}$ values averaged $0.78\pm 0.54 cm h^{-1}$
+* Variano et al. 2009 - $SF_6$ tracer released in the patterned marshes of the Florida Everglades indicated $k_{600}$ there ranged from 0.3 to 1.8 cm h^-1
+* Sebacher et al. 1983 measured gas exchange in a wetland pond free of emergent vegetation and wind speed 2 cm above the water surface, wind speed around 0.8 m s^-1. 
+
+

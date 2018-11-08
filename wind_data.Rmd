@@ -1,0 +1,143 @@
+---
+title: "k_calcs_wind_data"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, message=FALSE}
+library(RPostgreSQL)
+library(readr)
+library(magrittr)
+library(xts)
+library(dplyr)
+library(ggplot2)
+```
+
+```{r dbconnect, include=FALSE}
+password <- scan(".pgpass", what="")
+db <- dbConnect(PostgreSQL(), 
+                host = "sesync-postgis01.research.sesync.org",
+                dbname = "choptank", 
+                user = "palmergroup",
+                password = password)
+```
+
+# Wind speed
+
+
+```{sql, connection = db, output.var = "ts_result"}
+SELECT datavalue, valuedatetimeutcoffset, res.resultid, units.unitsname, valuedatetime, sf.samplingfeaturecode, meth.methodcode
+FROM odm2.timeseriesresultvalues tsrv
+INNER JOIN odm2.results res ON tsrv.resultid = res.resultid
+INNER JOIN odm2.featureactions fa ON res.featureactionid = fa.featureactionid
+INNER JOIN odm2.samplingfeatures sf ON sf.samplingfeatureid = fa.samplingfeatureid
+INNER JOIN odm2.actions acts ON acts.actionid = fa.actionid
+INNER JOIN odm2.units units ON units.unitsid = res.unitsid
+INNER JOIN odm2.methods meth ON meth.methodid = acts.methodid
+WHERE res.variableid = (SELECT variableid FROM odm2.variables WHERE variablenamecv = 'Wind speed')
+```
+
+
+```{r}
+ts_result$valuedatetime %>% as.POSIXct() %>% max()
+```
+
+```{r}
+wind_qb <- dplyr::filter(ts_result, samplingfeaturecode == "QB")
+wind_nd <- dplyr::filter(ts_result, samplingfeaturecode == "ND")
+```
+
+```{r}
+wind_xts <- xts(wind_qb$datavalue, order.by = wind_qb$valuedatetime)
+```
+
+interactive plot for inspecting time series 
+
+```{r}
+# wind_xts %>%
+#   dygraph() %>%
+#   dyRangeSelector() %>%
+#   dyLegend() %>%
+#   dyOptions(strokeWidth = 1) %>%
+#   # dyHighlight(highlightSeriesOpts = list(strokeWidth = 3)) %>%
+#   dyOptions(useDataTimezone = TRUE) %>%
+#   dyRoller(rollPeriod = 5) %>% # plotted point represents average of specified number of timestamps
+#   dyAxis("y", label = "wind speed (m/s)")
+```
+
+Aggregate QB wind data to hourly
+
+```{r}
+ep <- endpoints(wind_xts, on = "hour")
+wind_agg <- period.apply(wind_xts, INDEX = ep, FUN = mean)
+```
+
+```{r}
+wind_df <- wind_agg %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "datetime") %>%
+  rename(ws_ms = V1) %>%
+  mutate(datetime = as.POSIXct(datetime, tz = "GMT"))
+```
+
+```{r}
+write_csv(wind_df, "data/windspeed_qb.csv")
+```
+
+
+# Wind gust speed
+
+```{sql, connection = db, output.var = "windgusts"}
+SELECT datavalue,valuedatetimeutcoffset, res.resultid, units.unitsname, valuedatetime, sf.samplingfeaturecode, meth.methodcode
+FROM odm2.timeseriesresultvalues tsrv
+INNER JOIN odm2.results res ON tsrv.resultid = res.resultid
+INNER JOIN odm2.featureactions fa ON res.featureactionid = fa.featureactionid
+INNER JOIN odm2.samplingfeatures sf ON sf.samplingfeatureid = fa.samplingfeatureid
+INNER JOIN odm2.actions acts ON acts.actionid = fa.actionid
+INNER JOIN odm2.units units ON units.unitsid = res.unitsid
+INNER JOIN odm2.methods meth ON meth.methodid = acts.methodid
+WHERE res.variableid = (SELECT variableid FROM odm2.variables WHERE variablenamecv = 'Wind gust speed')
+```
+
+```{r}
+gusts_qb <- dplyr::filter(windgusts, samplingfeaturecode == "QB")
+gusts_nd <- dplyr::filter(windgusts, samplingfeaturecode == "ND")
+```
+
+```{r}
+gusts_xts <- xts(gusts_qb$datavalue, order.by = gusts_qb$valuedatetime)
+```
+
+```{r}
+# gusts_xts %>%
+#   dygraph() %>%
+#   dyRangeSelector() %>%
+#   dyLegend() %>%
+#   dyOptions(strokeWidth = 1) %>%
+#   # dyHighlight(highlightSeriesOpts = list(strokeWidth = 3)) %>%
+#   dyOptions(useDataTimezone = TRUE) %>%
+#   dyRoller(rollPeriod = 5) %>% # plotted point represents average of specified number of timestamps
+#   dyAxis("y", label = "wind gust speed (m/s)")
+```
+
+aggregate gusts to maximum
+
+```{r}
+ep <- endpoints(gusts_xts, on = "hour")
+gusts_agg <- period.apply(gusts_xts, INDEX = ep, FUN = max)
+```
+
+```{r}
+gusts_df <- gusts_agg %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "datetime") %>%
+  rename(gusts_ms = V1) %>%
+  mutate(datetime = as.POSIXct(datetime, tz = "GMT"))
+```
+
+```{r}
+write_csv(gusts_df, "data/windgusts_qb.csv")
+```

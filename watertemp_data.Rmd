@@ -1,0 +1,323 @@
+---
+title: "k_calcs_watertemp_data"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, message=FALSE}
+library(RPostgreSQL)
+library(readr)
+library(magrittr)
+library(xts)
+library(dplyr)
+library(ggplot2)
+```
+
+```{r dbconnect, include=FALSE}
+password <- scan(".pgpass", what="")
+db <- dbConnect(PostgreSQL(), 
+                host = "sesync-postgis01.research.sesync.org",
+                dbname = "choptank", 
+                user = "palmergroup",
+                password = password)
+```
+
+
+Temperature profile data aren't in the database yet, so read from files.
+
+```{r}
+read_hobo_mx2202 <- function(filename){
+  readr::read_csv(filename, skip = 2) %>%
+  rename(datetime = `Date Time - GMT -05:00`,
+         temp_F = `Temp, (*F)`,
+         intensity_lmft2 = `Intensity, (lum/ft²)`) %>%
+  dplyr::select(datetime, temp_F, intensity_lmft2)  %>%
+    mutate(temp_C = (temp_F - 32)*(5/9))
+}
+```
+
+```{r}
+files <- list.files("../Delmarva/data/hobos", full.names = TRUE)
+dl_dates <- sapply(files, function(x) substr(x, 36, 45)) %>% 
+  unname() %>% unique() %>% as.Date()
+
+qbMID <- grep(pattern = "20398209", files, value = TRUE) %>%
+  grep(pattern = as.character(max(dl_dates)), ., value = TRUE) %>%
+  read_hobo_mx2202()
+
+qbTOP <- grep(pattern = "20398211", files, value = TRUE) %>%
+  grep(pattern = as.character(max(dl_dates)), ., value = TRUE) %>%
+  read_hobo_mx2202()
+# qbMID2 <- grep(pattern = "2609", files, value = TRUE) %>%
+#   grep(pattern = as.character(max(dl_dates)), ., value = TRUE) %>%
+#   read_hobo_mx2202()
+```
+
+Aggregate five minute QB wind data to hourly
+```{r}
+qbMID_xts <- xts(qbMID$temp_C, order.by = qbMID$datetime)
+ep <- endpoints(qbMID_xts, on = "hour")
+temp_agg <- period.apply(qbMID_xts, INDEX = ep, FUN = mean)
+```
+
+```{r}
+temp_df <- temp_agg %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "datetime") %>%
+  rename(temp_C = V1) %>%
+  mutate(datetime = as.POSIXct(datetime, tz = ""))
+```
+
+```{r}
+# qbTOP_xts <- xts(qbTOP$temp_C, order.by = qbTOP$datetime)
+# ep <- endpoints(qbTOP_xts, on = "hour")
+# temp_agg <- period.apply(qbTOP_xts, INDEX = ep, FUN = mean)
+
+# temp_agg %>%
+temp_df$temp_C %>%
+  xts(order.by = temp_df$datetime) %>%
+  dygraph() %>%
+  dyRangeSelector() %>%
+  dyLegend() %>%
+  dyOptions(strokeWidth = 1) %>%
+  # dyHighlight(highlightSeriesOpts = list(strokeWidth = 3)) %>%
+  dyOptions(useDataTimezone = TRUE) %>%
+  dyRoller(rollPeriod = 5) %>% # plotted point represents average of specified number of timestamps
+  dyAxis("y", label = "water temp (C)")
+```
+
+Plots
+
+```{r}
+temp_df %>% 
+  mutate(date = lubridate::date(datetime)) %>%
+  mutate(time_hr = lubridate::hour(datetime)) %>% 
+  group_by(date) %>%
+  mutate(date_max = max(temp_C, na.rm = TRUE), 
+         date_min = min(temp_C, na.rm = TRUE),
+         date_range = date_max - date_min) %>%
+  # filter(date >= as.Date('2018-06-01') & date <= as.Date('2018-07-01')) %>%
+  ggplot(aes(x = date, y = date_range)) +
+  # geom_line() +
+  geom_line(aes(y = date_max, col = "red")) +
+  geom_line(aes(y = date_min, col = "blue")) +
+  # facet_wrap(~ lubridate::month(date)) +
+  # facet_wrap(~ lubridate::yday(date)) +
+  # facet_wrap(~ lubridate::wday(date, TRUE)) +
+  # xlim(c(0, 24)) +
+  theme_bw()
+```
+Looks like sensor was out of water from 8/26 to 9/10
+
+```{r}
+temp_df %>% 
+  mutate(date = lubridate::date(datetime)) %>%
+  mutate(time_hr = lubridate::hour(datetime)) %>% 
+  mutate(yday = lubridate::yday(datetime)) %>%
+  # group_by(date) %>%
+  # mutate(date_max = max(temp_C, na.rm = TRUE), 
+  #        date_min = min(temp_C, na.rm = TRUE),
+  #        date_range = date_max - date_min) %>%
+  filter(date >= as.Date('2018-07-23') & date <= as.Date('2018-08-25')) %>%
+  ggplot(aes(x = time_hr, y = temp_C, group = date)) +
+  geom_line(aes(col = yday), size = 2) +
+  # geom_line(aes(y = date_max, col = "red")) +
+  # geom_line(aes(y = date_min, col = "blue")) +
+  # facet_wrap(~ lubridate::month(date)) +
+  # facet_wrap(~ lubridate::yday(date)) +
+  # facet_wrap(~ lubridate::wday(date, TRUE)) +
+  xlim(c(0, 24)) +
+  scale_color_viridis_c() +
+  theme_bw()
+```
+
+8/26 to 9/10
+
+```{r}
+pdf("temp_by_weeks_QB.pdf", width = 10, height = 12)
+temp_df %>%
+  mutate(date = lubridate::date(datetime)) %>%
+  mutate(time_hr = lubridate::hour(datetime)) %>% 
+  mutate(yday = lubridate::yday(datetime)) %>%
+  # group_by(date) %>%
+  # mutate(date_max = max(temp_C, na.rm = TRUE),
+  #        date_min = min(temp_C, na.rm = TRUE),
+  #        date_range = date_max - date_min) %>%
+  filter(date <= as.Date('2018-08-26') | date >= as.Date('2018-09-11')) %>%
+  # mutate(datetime = as.POSIXct(datetime)) %>% dplyr::select(-date) %>%
+  ggplot(aes(x = datetime, y = temp_C)) +
+  # geom_line(aes(col = yday), size = 2) +
+  geom_line(col = "gray") +
+  geom_point(size = 2, aes(colour = time_hr)) +
+  # geom_line(data = wl_df, aes(x = datetime, y = wl_m)) +
+  # geom_line(aes(y = date_max, col = "red")) +
+  # geom_line(aes(y = date_min, col = "blue")) +
+  # facet_wrap(~ lubridate::month(date)) +
+  # facet_wrap(~ lubridate::yday(date)) +
+  # facet_wrap(~ lubridate::wday(date, TRUE)) +
+  facet_wrap(~ lubridate::week(date), scales = "free_x", ncol = 2) +
+  # xlim(c(0, 24)) +
+  # scale_color_gradient2(low = "yellow", mid = "red", high = "blue", midpoint = 14) +
+  scale_color_viridis_c() +
+  theme_bw()
+dev.off()
+```
+Typically, daily temperature peak around 2pm. 
+
+```{r}
+temp_df %>%
+  mutate(date = lubridate::date(datetime)) %>%
+  mutate(time_hr = lubridate::hour(datetime)) %>% 
+  mutate(yday = lubridate::yday(datetime)) %>%
+  # group_by(date) %>%
+  # mutate(date_max = max(temp_C, na.rm = TRUE),
+  #        date_min = min(temp_C, na.rm = TRUE),
+  #        date_range = date_max - date_min) %>%
+  filter(date >= as.Date('2018-08-01') & date <= as.Date('2018-08-12')) %>%
+  # mutate(datetime = as.POSIXct(datetime)) %>% dplyr::select(-date) %>%
+  ggplot(aes(x = datetime, y = temp_C)) +
+  # geom_line(aes(col = yday), size = 2) +
+  geom_line(col = "gray") +
+  geom_point(size = 2, aes(col = time_hr)) +
+  # geom_line(aes(y = date_max, col = "red")) +
+  # geom_line(aes(y = date_min, col = "blue")) +
+  # facet_wrap(~ lubridate::month(date)) +
+  # facet_wrap(~ lubridate::yday(date)) +
+  # facet_wrap(~ lubridate::wday(date, TRUE)) +
+  # xlim(c(0, 24)) +
+  scale_color_viridis_c() +
+  theme_bw()
+```
+
+```{r}
+temp_df %>%
+  mutate(date = lubridate::date(datetime)) %>%
+  mutate(time_hr = lubridate::hour(datetime)) %>% 
+  mutate(yday = lubridate::yday(datetime)) %>%
+  # group_by(date) %>%
+  # mutate(date_max = max(temp_C, na.rm = TRUE),
+  #        date_min = min(temp_C, na.rm = TRUE),
+  #        date_range = date_max - date_min) %>%
+  filter(date >= as.Date('2018-08-01') & date <= as.Date('2018-08-12')) %>%
+  # mutate(datetime = as.POSIXct(datetime)) %>% dplyr::select(-date) %>%
+  ggplot(aes(x = time_hr, y = temp_C, group = date)) +
+  # geom_line(aes(col = yday), size = 2) +
+  geom_line(size = 2, aes(col = yday)) +
+  # geom_line(aes(y = date_max, col = "red")) +
+  # geom_line(aes(y = date_min, col = "blue")) +
+  # facet_wrap(~ lubridate::month(date)) +
+  # facet_wrap(~ lubridate::yday(date)) +
+  # facet_wrap(~ lubridate::wday(date, TRUE)) +
+  xlim(c(0, 24)) +
+  scale_color_viridis_c() +
+  theme_bw()
+```
+```{r}
+temp_df %>% 
+  mutate(date = lubridate::date(datetime)) %>%
+  mutate(time_hr = lubridate::hour(datetime)) %>% 
+  # filter(date >= as.Date('2018-06-01') & date <= as.Date('2018-07-01')) %>%
+  ggplot(aes(x = time_hr, y = temp_C, group = date)) +
+  geom_line(aes(col = date)) +
+  # facet_wrap(~ lubridate::month(date)) +
+  # facet_wrap(~ lubridate::yday(date)) +
+  # facet_wrap(~ lubridate::wday(date, TRUE)) +
+  xlim(c(0, 24)) +
+  theme_bw()
+```
+
+```{r}
+temp_df %>% 
+  mutate(date = lubridate::date(datetime)) %>%
+  mutate(time_hr = lubridate::hour(datetime)) %>% 
+  # group_by(date) %>%
+  # mutate(date_max = max(temp_C, na.rm = TRUE), 
+  #        date_min = min(temp_C, na.rm = TRUE),
+  #        date_range = date_max - date_min) %>%
+  filter(date >= as.Date('2018-09-11')) %>%
+  ggplot(aes(x = time_hr, y = temp_C, group = date)) +
+  geom_line() +
+  # geom_line(aes(y = date_max, col = "red")) +
+  # geom_line(aes(y = date_min, col = "blue")) +
+  # facet_wrap(~ lubridate::month(date)) +
+  facet_wrap(~ lubridate::yday(date)) +
+  # facet_wrap(~ lubridate::wday(date, TRUE)) +
+  xlim(c(0, 24)) +
+  theme_bw()
+```
+
+```{r}
+# difference object
+dT <- diff(qbMID_agg[,1])
+# plot(dT)
+# head(dT)
+```
+
+Add column for water depth (Right now assuming static at 1m)
+
+```{r}
+q_ts <- merge(qbMID_agg, dT) %>%
+  as.data.frame() %>%
+  dplyr::rename(temp_C = qbMID_agg) %>%
+  mutate(waterdepth_m = 1)
+# q_ts <- merge(qbBOT_agg, dT) %>% 
+#   as.data.frame() %>% 
+#   rename(temp_C = qbBOT_agg) %>%
+#   mutate(waterdensity = 
+#            purrr::map_dbl(temp_C, ~calc_water_density_kgm3(temp_C = .x))) %>%
+#   mutate(cp = 
+#            purrr::map_dbl(temp_C, ~calc_Cp_JkgK(temp_C = .x))) %>%
+#   mutate(waterdepth_m = 1) %>%
+#   mutate(q = (dT/3600) * waterdensity * cp * waterdepth_m)
+```
+
+Apply function to calculate q to time series
+
+```{r}
+q_ts$q_wm2 <- q_ts %>% pmap_dbl(calc_q_heatflux)
+```
+
+
+```{r}
+q_xts <- merge(dT, q_ts$q_wm2)
+q_xts <- merge(q_xts, q_ts$temp_C)
+q_xts <- merge(q_xts, q_ts$waterdepth_m)
+# head(q_xts)
+# plot(q_xts[,2])
+```
+
+```{r}
+# dygraph(q_xts[,"q_ts.q_wm2"]) %>%
+#   dyRangeSelector() %>%
+#   dyLegend() %>%
+#  dyAxis("y", label = "Q") %>%
+#   dyOptions(strokeWidth = 1)
+```
+
+
+
+
+interactive plot for inspecting time series 
+
+```{r}
+# wind_xts %>%
+#   dygraph() %>%
+#   dyRangeSelector() %>%
+#   dyLegend() %>%
+#   dyOptions(strokeWidth = 1) %>%
+#   # dyHighlight(highlightSeriesOpts = list(strokeWidth = 3)) %>%
+#   dyOptions(useDataTimezone = TRUE) %>%
+#   dyRoller(rollPeriod = 5) %>% # plotted point represents average of specified number of timestamps
+#   dyAxis("y", label = "wind speed (m/s)")
+```
+
+Need to filter out the times when the sensor is out of the water, but for now that will not overlap with period with all three data sources (water level only through Sept 1?)
+
+```{r}
+write_csv(temp_df, "data/watertemp_qbMID.csv")
+```
+
+

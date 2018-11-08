@@ -16,9 +16,10 @@ library(dplyr)
 library(dygraphs)
 library(purrr)
 library(ggplot2)
-library(RPostgreSQL)
 library(lubridate)
 library(readr)
+library(data.table)
+library(forcats)
 ```
 
 Calculate a time series of $k$ in $\frac{cm}{hr}$ using inputs: water temperature, water depth, wind speed. $k$ is calculated using equation 2 in Poindexter et al. 2016, which uses a different formulation for wind-driven vs. thermal convection driven gas exchange based on thresholds for heat flux. 
@@ -224,6 +225,10 @@ Water temperature measured at 3 locations in a vertical profile, in 2 wetlands. 
 
 Look at typical daily time series pattern of temperature in the water column, to determine how to calculate $\frac{dT}{dt}$. Poindexter and Variano use linear regression of temperature readings during their experiments. 
 
+```{r}
+temp_df <- read_csv("data/watertemp_qbMID.csv")
+```
+
 ### Wind
 
 In-canopy wind speed measured with sonic anemometers approximately 1m over the water surface (varies between xx and xx due to changes in water level). 
@@ -247,20 +252,85 @@ wind_df %>%
   theme_bw()
 ```
 
+wind-driven k is just a function of wind speed
 
+```{r}
+wind_df <- wind_df %>%
+  mutate(k_wind = map_dbl(ws_ms, ~calc_k_poindexter2a(ws = .x)))
+```
+
+```{r}
+wind_df %>%
+  mutate(date = lubridate::date(datetime)) %>%
+  mutate(time_hr = lubridate::hour(datetime)) %>% 
+  # filter(date >= as.Date('2018-06-01') & date <= as.Date('2018-07-01')) %>%
+  ggplot(aes(x = time_hr, y = k_wind, group = date)) +
+  geom_line(aes(col = date)) +
+  # facet_wrap(~ lubridate::month(date)) +
+  # facet_wrap(~ lubridate::yday(date)) +
+  # facet_wrap(~ lubridate::wday(date, TRUE)) +
+  xlim(c(0, 24)) +
+  theme_bw()
+```
+
+```{r}
+wind_df %>%
+  mutate(date = lubridate::date(datetime)) %>%
+  mutate(time_hr = lubridate::hour(datetime)) %>% 
+  mutate(wind_thresh = ws_ms > 0.7) %>%
+  # filter(date >= as.Date('2018-06-01') & date <= as.Date('2018-07-01')) %>%
+  ggplot(aes(x = datetime, y = k_wind, group = date)) +
+  geom_point(aes(col = wind_thresh), size = 0.5) +
+  # facet_wrap(~ lubridate::month(date)) +
+  # facet_wrap(~ lubridate::yday(date)) +
+  # facet_wrap(~ lubridate::wday(date, TRUE)) +
+  # xlim(c(0, 24)) +
+  theme_bw()
+```
 
 ### Water depth
 
-Combine into one data frame and Aggregate time series to hourly averages
+```{r}
+wl_df <- read_csv("data/waterlevel_qb.csv")
+```
+
+### Combine data
+
+Combine 3 data sources into one data frame (wl_df, wind_qb, temp_df)
 
 ```{r}
-# head(qbMID) 
-# qbMID_xts <- xts(qbMID$temp_C, order.by = qbMID$datetime)
-# # hourly aggregate
-# ep <- endpoints(qbMID_xts, on = "hour")
-# qbMID_agg <- period.apply(qbMID_xts[,], INDEX = ep, FUN = mean)
-# head(qbMID_agg)
-# plot(qbMID_agg)
+head(wl_df) # water level is daily
+head(wind_df) # hourly wind speed starts 6-27, includes k
+head(temp_df) # hourly temp, starts 7-21
+```
+
+```{r}
+tail(temp_df) # ends 9-30
+tail(wind_df) # ends 9-30
+tail(wl_df) # ends 9-04
+```
+hourly time series of wind, water level, temp between 7-21 and 9-04
+
+Rolling merge with data.table package
+
+```{r}
+temp_dt <- temp_df %>% 
+  data.table() %>%
+  setkey(datetime)
+wind_dt <- wind_df %>% 
+  data.table() %>%
+  setkey(datetime)
+
+kdata <- temp_dt[wind_dt, roll = "nearest"]
+
+
+kdata <- kdata %>%
+  mutate(date = lubridate::date(datetime)) %>% 
+  left_join(dplyr::select(wl_df, -datetime))
+```
+
+```{r}
+write_csv(kdata, "data/kdata.csv")
 ```
 
 # Apply Calculations
@@ -279,83 +349,67 @@ Calculate time series of $q$ surface heat flux ($Wm^{-2}$) as a function of temp
 
 * $\frac{dT_b}{dt}$ in $\frac{K}{sec}$ will need to convert from $\frac{C}{hr}$
 
-Calculate differences
-```{r}
-# difference object
-dT <- diff(qbMID_agg[,1])
-# plot(dT)
-# head(dT)
-```
-
-Add column for water depth (Right now assuming static at 1m)
 
 ```{r}
-q_ts <- merge(qbMID_agg, dT) %>%
-  as.data.frame() %>%
-  dplyr::rename(temp_C = qbMID_agg) %>%
-  mutate(waterdepth_m = 1)
-# q_ts <- merge(qbBOT_agg, dT) %>% 
-#   as.data.frame() %>% 
-#   rename(temp_C = qbBOT_agg) %>%
-#   mutate(waterdensity = 
-#            purrr::map_dbl(temp_C, ~calc_water_density_kgm3(temp_C = .x))) %>%
-#   mutate(cp = 
-#            purrr::map_dbl(temp_C, ~calc_Cp_JkgK(temp_C = .x))) %>%
-#   mutate(waterdepth_m = 1) %>%
-#   mutate(q = (dT/3600) * waterdensity * cp * waterdepth_m)
-```
-
-Apply function to calculate q to time series
-
-```{r}
-q_ts$q_wm2 <- q_ts %>% pmap_dbl(calc_q_heatflux)
-```
-
-
-```{r}
-q_xts <- merge(dT, q_ts$q_wm2)
-q_xts <- merge(q_xts, q_ts$temp_C)
-q_xts <- merge(q_xts, q_ts$waterdepth_m)
-# head(q_xts)
-# plot(q_xts[,2])
-```
-
-```{r}
-# dygraph(q_xts[,"q_ts.q_wm2"]) %>%
-#   dyRangeSelector() %>%
-#   dyLegend() %>%
-#  dyAxis("y", label = "Q") %>%
-#   dyOptions(strokeWidth = 1)
-```
-
-```{r}
-kdf <- q_xts %>% 
-  as.data.frame() %>%
-  tibble::rownames_to_column() %>% 
-  dplyr::rename(datetime = rowname, q_wm2 = q_ts.q_wm2,
-                temp_C = q_ts.temp_C, waterdepth_m = q_ts.waterdepth_m) %>%
-  mutate(q_neg = q_wm2 <0) %>%
+kdf <- kdata %>% 
+  filter(!is.na(wl_m)) %>%
+  # mutate(q_neg = q_wm2 <0) %>%
   mutate(temp_thresh = temp_C < 4)
 ```
 
 ```{r}
 head(kdf)
 ```
+Crop to just July 24 - August 24
+
+```{r}
+kdf <- kdf %>% 
+  dplyr::filter(date >= as.Date('2018-07-23') & date <= as.Date('2018-08-24'))
+```
 
 ```{r}
 kdf %>% 
-  mutate(datetime = as.POSIXct(datetime)) %>%
-  ggplot(aes(x = datetime, y = q_wm2)) +
+  dplyr::select(-date, -temp_thresh, -k_wind) %>%
+  tidyr::gather(variable, value, temp_C:wl_m) %>%
+  ggplot(aes(x = datetime, y = value)) +
   geom_line() +
+  facet_wrap(vars(variable), scales = "free_y", ncol = 1) +
   theme_bw()
 ```
 
+Heat flux
+
+```{r}
+kdf$dtemp <- c(NA, diff(kdf$temp_C)) # revisit for smoothing
+kdf %>%
+  # slice(-1) %>% 
+  mutate(dt_pos = dtemp>0) %>%
+  ggplot(aes(x = datetime, y = temp_C)) +
+  geom_line(col = "gray") +
+  geom_point(aes(col = dt_pos)) + theme_bw()
+```
+
+```{r}
+kdf$q_wm2 <- pmap_dbl(list(temp_C = kdf$temp_C,
+              waterdepth_m = kdf$wl_m,
+              dT = kdf$dtemp),
+              calc_q_heatflux)
+
+```
+
+```{r}
+kdf %>%
+  mutate(dt_pos = dtemp>0) %>%
+  ggplot(aes(x = datetime, y = q_wm2)) +
+  geom_line(col = "gray") +
+  geom_point(aes(col = dt_pos)) + theme_bw()
+```
 
 ```{r}
 # kdf$Ra <- kdf %>% pmap_dbl(calc_rayleigh())
 kdf$Ra <- pmap_dbl(list(q = kdf$q_wm2, 
                         temp_C = kdf$temp_C, 
-                        lscale = kdf$waterdepth_m), 
+                        lscale = kdf$wl_m), 
                    calc_rayleigh)
 ```
 
@@ -364,30 +418,57 @@ kdf$Ra_thresh <- kdf$Ra > 8e6
 ```
 
 ```{r}
+kdf %>%
+  ggplot(aes(x = datetime, y = Ra)) +
+  geom_line(col = "gray") +
+  geom_point(aes(col = Ra_thresh)) + theme_bw()
+```
+
+```{r}
 kdf$k_category <- NA
-kdf <- kdf %>%
+kdf <-kdf %>%
+  mutate(q_pos = q_wm2 >=0) %>% 
   mutate(k_category = dplyr::case_when(
-    (q_neg == TRUE & Ra_thresh == TRUE) | temp_thresh == TRUE ~ "thermal"
-  )) %>% 
-  mutate(k_category = dplyr::case_when(
-    (q_neg == FALSE) ~ "wind"
+    q_pos ~ "wind",
+    (q_wm2 < 0 | Ra_thresh < 8e6) ~ "thermal"
   ))
-kdf <- dplyr::filter(kdf, !is.na(q_wm2))
+```
+
+
+
+```{r}
+kdf_thermal <- kdf %>% dplyr::filter(k_category == "thermal")
+
+kdf_thermal$k_thermal <- purrr::pmap_dbl(list(q = kdf_thermal$q_wm2, 
+                                              temp_C = kdf_thermal$temp_C),
+                   calc_k_poindexter2b)
 ```
 
 ```{r}
-# kdf$k_thermal <- NA
-# kdf$k_thermal <-
-kdf %>% dplyr::filter(k_category == "thermal") %>% head()
-  mutate(
-  case_when(k_category == "thermal" ~ 
-              purrr::pmap_dbl(list(q = q_wm2, temp_C = temp_C),
-                       calc_k_poindexter2b))) %>% head()
+head(kdf_thermal)
+
+kdf_join <- kdf %>% left_join(
+  dplyr::select(kdf_thermal, datetime, k_thermal)
+)
+kdf_join <- kdf_join %>%
+  mutate(k_mix = dplyr::case_when(
+    k_category == "wind" ~ k_wind,
+    k_category == "thermal" ~ k_thermal
+  ))
 ```
 
 ```{r}
-kdf %>% dplyr::filter(k_category == "wind") %>% head()
+kdf_join %>%
+  ggplot(aes(x = datetime, y = k_mix)) +
+  geom_line() +
+  geom_point(aes(col = k_category)) +
+  scale_color_brewer(palette = "Set1") +
+  facet_wrap(~ lubridate::week(date), scales = "free_x", ncol = 1) +
+    theme_bw() +
+  theme(strip.background = element_blank(),
+   strip.text.x = element_blank())
 ```
+
 
 # Notes
 
